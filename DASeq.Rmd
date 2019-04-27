@@ -1,0 +1,236 @@
+---
+title: "DASeq"
+author: "Zachery Dickson"
+date: "April 25, 2019"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("DASeq.R")
+```
+
+## Experimental Design
+
+The data being analyzed for differential abundance is a set of samples and controls of known bacteria spiked onto a blood background. The samples have either a high (1000 CFU) or low (10 CFU) spike, and are treated in three ways.
+
+* A standard extraction procedure where the the sample is pelleted and the DNA extracted from the pellet then sonicated prior to library preparation.
+* The same procedure with a saponin pretreatment step to lyse human cells, hopefully reducing background DNA levels.
+* A procedure where the supernatant is taken instead, and the extracted DNA was not sonicated.
+
+Each combination of extraction method and spike concentration was split and either shotgun sequenced, or enriched with a baitset targeted towards Sepsis Pathogens.
+All Samples were performed in triplicate.
+Additionally there are two positive controls and 4 blank samples:
+
+* One each of High and Low concentration bacteria spiked onto water
+* One water extraction blank treated as either a pellet or supernatant
+* One blood blank 
+* One library blank which was a library preparation performed with an empty tube
+
+Each of the blanks and controls were both enriched and shotgun sequenced, and performed in singlet.
+
+All samples and controls were run on two lanes of the sequencer.
+
+## Data
+
+The specific input data is the number of reads with map to a particular organism perfectly. That is maps with no mismatches, and with any soft-clipping occuring on portions of the read outside of the reference sequence. Enriched samples were mapped to the sequence of the baits used during enrichment. The baits were padded with up to 100bp upstream and downstream. The mapped reads had to be overlapping the actual bait to be counted. The Shotgun sequenced samples were mapped to the whole genomes of the pathogens used to design the bait set.
+escriptions of the samples, the experimental design, as well as information about the library size, human background reads, and unmapped reads is all contained in the SampleDesc.csv file.
+
+```{r Loading}
+Quant = read.table("OrgQuant.tab",sep="\t",header = T,stringsAsFactors = FALSE,check.names = F)
+SampleDesc = read.csv("SampleDesc.csv")
+```
+
+## Subsampling to a particular Taxonomical Level
+
+The quantification file has the number of reads mapping to each taxon without mismatches. The 'Organism' in each row is denoted with a trinary name, in the format "Genus|Species|Strain". In the cases where a bait is desigend at the genus or species levels, the lower taxonomic levels have an NA. The entire Quant file can then be subset to a particular taxonomic level by truncating the organism name to the desired level and summing the reads for all rows with the same name. Rows with no information at the desired level may be discarded. This is acheived with the following function:
+
+```{r SubSampleToTaxa_code}
+SubSampleToTaxonLvl
+```
+
+## Normalizing for variable library size
+
+The Quant file only contains data on reads which mapped to a pathogen, but does not include direct information about the size of the library. This information is stored in the Sample file. In order for DESeq to normalize the samples, it will require some information on how to accomplish this. Exactly how to normalize the samples could be done in  a few ways:
+
+* Based on the Total Size of the library, i.e. The number of reads with the index for each sample
+* Based on the Trimmed reads for the library, i.e. The number of reads which pass QC
+* Based on the Nonhuman library size, i.e. The number of trimmed reads which do not map to the human Genome
+
+One could also not normalize at all, but include a row of pseudocounts to prevent any one sample from having no counts.
+
+The following function extracts the appropriate information from the SampleDesc object to add the requested normalization data:
+
+```{r AddNormalization_code}
+AddNormalizationRow
+```
+
+## Selected Data
+
+The analysis that will be presented will be done at the level of Species, normalizing by the trimmed library size, with Human and Non-Human counts split into two rows. This allows for examining the effect on the human background due to the Saponin pretreatment.
+There are several common contaminants which are in the same genus as species we have spiked with (eg. Burkholderia Cenocepacia). Operating at the genus level would make distinguishing these contaminants from the spiked organisms impossible. Recent work has demonstrated that there is some strain level non-specificity in the baits which were used which makes strain level counts suspect.
+Additionally the Library Blank was removed from the analysis, as it confounded the experimental design. Additionally as all samples would be expected to display any contaminants from the library preparation, the library blank should ahve no effect on differential abundance.
+
+```{r SelectData}
+Quant_Spec = SubSampleToTaxonLvl(Quant,"Species")
+Quant_Spec = AddNormalizationRow(Quant_Spec,SampleDesc,"NonHuman",nrowName = "Unmapped|reads")
+Quant_Spec = AddNormalizationRow(Quant_Spec,SampleDesc,"Pseudo",pseudo = SampleDesc$HumanReads,nrowName = "Homo|sapiens")
+Quant_Spec = Quant_Spec[!grepl("ID-LBS",colnames(Quant_Spec))]
+SampleDesc = SampleDesc[!grepl("ID-LBS",SampleDesc$Names),]
+```
+
+## Initial Analysis
+
+Due to the very low number of mapped reads across the samples, some deviations from the standard DESeq2 function were required.
+These changes are focused on the step of estimating Size Factors. The standard method of calculating geometric means will zero out in almost all cases. Therefore the poscounts method is used: Take the sum of the values where the log is defined, and divided by the total length including zero-counts. Additionaly the DESeq2 documentation recommends using the shorth function rather than the median to calculate the location of the size factors when working with low count data. The adapted workflow, as well as a heatmap of the normalized counts is generated with the following function:
+
+```{r DASeq_code}
+DASeq
+```
+
+As each sample has two technical replicates, one for each lane, We can initially check if there is any effect due to lane.
+```{r CheckLane}
+Design = ~ Lane + Extraction + Background * Spike + Sequencing
+DAObj = DASeq(Quant_Spec,SampleDesc,formula = Design)
+resultsNames(DAObj)
+res = results(DAObj,name="Lane_L002_vs_L001")
+res[sort.list(res$padj),c("log2FoldChange","padj")]
+```
+
+None of the Organisms are Differntially Abundant due to Lane, so the technical replicates can be collapsed together, and the analysis rerun without Lane in the design.
+
+```{r CollapseLane}
+Design = ~ Extraction + Background * Spike + Sequencing
+techRep = sapply(strsplit(as.character(DAObj$Names),"_"),function(x){paste0(x[-length(x)],collapse = "_")})
+SampleDesc$Lane=NULL
+DAObj = DASeq(Quant_Spec,SampleDesc,formula=Design,collapseBy = techRep,normRows = 2)
+```
+
+At this point we can also examine the normalized counts with a heatmap generated by pheatmap.
+The noteable features demonstrated by the heatmap:
+
+* Even after normalizing for mappable reads, the shotgun samples have higher read counts than the enrichment
+* The Enrichment has lower background signals than the shotgun samples
+* Six of the 7 spiked species cluster apart from almost every other species
+     - *Strepococcus pneumonia*(Top Cyan) was spiked but was not captured in most enrichment samples
+     - *Mycobacterium tuberculosis*(Bottom Pink) was not spiked but appears in most samples in nearly condition invariant manner
+     - The sister group to the larger spike cluster is primarily composed of species in the same genus as the spiked organisms
+* Low Spike Samples have lower read counts than High Spike Samples
+* The Water blanks (last two columns) have more pathogen reads than the Blood Blank (Third last column)
+
+```{r Fig1, echo=FALSE,fig.width=8.5,fig.height=11,fig.cap="Fig 1 - Heatmap of All Normalized Read Counts",fig.align="center"}
+SpikeSpecies = data.frame(Species = as.factor(ifelse(grepl("Escherichia\\|coli|\\|multivorans|\\|pneumoniae|\\|constellatus|\\|intermedius|\\|aureus",
+                              Quant_Spec$Organism),"Spike","Non-Spike")),row.names = Quant_Spec$Organism)
+PlotHeatmap(DAObj,normRows = 2,row_annote = SpikeSpecies)
+```
+
+## Differential Abundance
+
+We can interate over each of the result Names of the DAObject and extract the differentially abundant organisms. As done with this function:
+
+```{r DAOrgList_code}
+DAOrgList
+```
+
+```{r resultNames}
+resultsNames(DAObj)
+```
+
+Before going over each factor individually, the following is importnat information:
+
+* The seven spiked Strains were
+     - *Burkholderia multivorans* ATCC_17616
+     - *Escherichia coli* BW25113
+     - *Klebsiella pneumoniae* N25C9
+     - *Staphylococcus aureus* IIDRC0017
+     - *Streptococcus constellatus* C1050
+     - *Streptococcus intermedius* C196
+     - *Streptococcus pneumoniae* R6
+* Most of the spike bacteria are extracellular parasites, but *Burkholderia* and *Streptococcus* species have been known survive intracellularly
+* Due to a lack of a closed genome no baits were designed for the spiked *E.coli* at the strain or species level, and it should ideally not appear in the enriched samples, only in the shotgun samples
+* The blood spiked onto was a pool of blood from patients in the intensive care unit. Any donor to the ppol may or may not have had a blood infection.
+* The numerical values are the log2 fold change of the first level vs the second level
+
+### Saponin PreTreatment Vs Normal Extraction
+
+```{r DifferentialAbundance_1}
+DAOrgList(DAObj,resultsNames(DAObj)[2])
+```
+
+Only as subset of the Spike Organisms appear to be affected by the Saponin pre-treatment, and the effect does not have a consistent direction. Indicating Saponin may bias the bacterial component of the sample.
+
+### Supernatant vs Normal Extraction
+
+```{r DifferentialAbundance_2}
+DAOrgList(DAObj,resultsNames(DAObj)[3])
+```
+
+The only organism with differetial abundance is *Haemophilus influenzae*, which is more abundant in the supernatant. While not a spike organism, other work with this data hs identified this organism as potentially being a component of the pooled blood. Having been one of the only organisms found in the blood, and found only in the supernatant.
+
+### Water vs Blood Background
+
+```{r DifferentialAbundance_3}
+DAOrgList(DAObj,resultsNames(DAObj)[4])
+```
+
+A couple of the spike organisms appear to be more abundant in a water background than blood. This likely has less to do with the blanks being contaminated with the spike, than the fact that in the experimental design the water blanks and the positive control have the same background. The unmapped reads may be sourced from the blood background.
+
+### Low Spike vs High Spike
+
+```{r DifferentialAbundance_4}
+DAOrgList(DAObj,resultsNames(DAObj)[5])
+```
+
+As expected several of the spiked bacteria are negatively associated with reduced abundance in the low spike compared to the high spike. The reduced abundance of unmapped, non-human reads may be indicitive that some of these reads are simply failed assignments of reads originating from the spiked organisms.
+
+### No Spike vs High Spike
+
+No Organsisms were significantly differentially abundant. This is a concerning result, as thes spiked samples should be most different from the unspiked smaples. However, the Water blanks have higher abundance for many organisms than expected. 
+
+### Shotgun vs Enrichment
+
+```{r DifferentialAbundance_5}
+DAOrgList(DAObj,resultsNames(DAObj)[7])
+```
+
+This factor has the most differentially abundant species, all of which are more abundant in the shotgun samples. Larger library sizes, no loss of DNA via Enrichment, as well as more DNA to which to map (whole genomes vs padded baits) for the shotgun samples likely account for these differences.
+
+Neither of the interactions had significantly differentially abundant species.
+
+## Test Case 
+
+In the intended use case for this analysis, differntial abundance between a known blood blank, and the patients samples would be the intended comparison. 
+This will be simulated with our data by restricting to the high concentration spike enrichment on a blood background with a saponin pre-treatement as the Sample and the blood blank. The Sample was selected based on other work done with this dataset indicating Saponin as the best extraction method.
+
+```{r GenerateTestData}
+InTest = SampleDesc$Names[
+     InTest = SampleDesc$Description %in% c("Saponin","BloodBlank") & SampleDesc$Sequencing == "Enrichment" & SampleDesc$Spike %in% c("High","None")]
+Quant_Test = Quant_Spec[,c(1,match(InTest,colnames(Quant_Spec)))]
+Quant_Test = Quant_Test[apply(Quant_Test[-1],1,sum) > 0,]
+TestDesc = SampleDesc[match(InTest,SampleDesc$Names),]
+techRep = sapply(strsplit(as.character(TestDesc$Names),"_"),function(x){paste0(x[-length(x)],collapse = "_")})
+Design = ~ Spike
+DAObj = DASeq(Quant_Test,TestDesc,formula = Design,collapseBy = techRep)
+SpikeSpecies = data.frame(Species = as.factor(ifelse(grepl("Escherichia\\|coli|\\|multivorans|\\|pneumoniae|\\|constellatus|\\|intermedius|\\|aureus",
+                              Quant_Test$Organism),"Spike","Non-Spike")),row.names = Quant_Test$Organism)
+PlotHeatmap(DAObj,normRows = 2,row_annote = SpikeSpecies,show_rownames = T)
+DAOrgList(DAObj)
+```
+
+None of the organisms which appear in the high saponin sample are differentially abundat from the blood blank given the data at hand. This is almost certainly because there is no replication of the blood blank. To evaluate how many replicates of a near empty sample would be required in practice we can simply copy the blank until some significance is noted.
+
+```{r DuplicateBlanks}
+for (copies in 1:5){
+     print(DAOrgList(SimDASeq(DAObj,normrows = 2,sim = copies, p=0)))
+}
+```
+
+After Two copies of the current blood blank *Streptococcus Intermedius* becomes significant, but even with increasing copies, nothing else becomes significant. These copied blanks are also not particularly valid. The same test could be done with simulated blanks. Blanks could be simulated with a negative binomial distribution, with a target of 1 success and a probability of failure equal to 1/ (9 + 2). This probability uses the pseudo-observations of 1 read across all 9 species, and 0 reads across all 9 species. Where the simulated reads fall across the 9 species may effect the observed significance. To make conclusions with this in mind, multiple simulations will be performed for each number of simulated blanks, and the number of simulations in which each organism is significant will be counted.
+
+```{r SimulatedBlanks}
+DA_UnderSimulatedBlanks(DAObj,normrows = 2,Trials = 100,p=1/11)
+```
+
+The result of simulation is essentially the same as duplicating the blanks. *Streptococcus intermedius* is differentially abundant after just two simulated blanks, but there is no indication that any other species will become significant. Of note is that significance is less likely at 3 simulated blanks than either 2 or 4.
+
+In the main paper a similar analysis is done, where technical replicates are not collapsed, and the reads are normalized only by the number of non-human reads. The quite different results are indicative that the low read counts make this analysis very sensitive to cohoices such as normalization.
